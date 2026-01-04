@@ -1,24 +1,33 @@
 import { Pool } from 'pg';
 import { Campaign } from './types';
+import { CONFIG } from './config';
 
-// Singleton pool
+// Singleton pool instance
 let pool: Pool | null = null;
 
+/**
+ * Get or create the database connection pool (singleton pattern).
+ */
 function getPool(): Pool {
   if (!pool) {
     pool = new Pool({
-      host: process.env.DB_HOST || 'localhost',
-      port: parseInt(process.env.DB_PORT || '5432'),
-      database: process.env.DB_NAME || 'mixoads',
-      user: process.env.DB_USER || 'postgres',
-      password: process.env.DB_PASSWORD || 'postgres'
+      host: CONFIG.database.host,
+      port: CONFIG.database.port,
+      database: CONFIG.database.name,
+      user: CONFIG.database.user,
+      password: CONFIG.database.password,
     });
   }
   return pool;
 }
 
+/**
+ * Save a campaign to the database using upsert (INSERT ... ON CONFLICT).
+ * Uses parameterized queries to prevent SQL injection.
+ */
 export async function saveCampaignToDB(campaign: Campaign): Promise<void> {
-  if (process.env.USE_MOCK_DB === 'true') {
+  // Use mock database for assignment
+  if (CONFIG.database.useMock) {
     console.log(`      [MOCK DB] Saved campaign: ${campaign.id}`);
     return;
   }
@@ -49,12 +58,15 @@ export async function saveCampaignToDB(campaign: Campaign): Promise<void> {
       campaign.conversions
     ]);
 
-  } catch (error: any) {
-    throw new Error(`Database error: ${error.message}`);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Database error: ${message}`);
   }
 }
 
-// Add cleanup function for graceful shutdown
+/**
+ * Close the database connection pool gracefully.
+ */
 export async function closeDB(): Promise<void> {
   if (pool) {
     await pool.end();

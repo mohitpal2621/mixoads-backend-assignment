@@ -196,12 +196,14 @@ All standard PostgreSQL best practices. One pool shared across calls, proper ups
 
 **What I changed:**  
 - Split the god function into smaller focused functions: `fetchWithTimeout`, `fetchWithRetry`, `syncSingleCampaign`, `processCampaignsInBatches`
-- Added a proper `Campaign` interface in `types.ts`
+- Created `src/config.ts` - Centralized configuration with all magic numbers and env vars extracted
+- Created `src/errors.ts` - Custom error classes (`ApiError`, `RateLimitError`, `TimeoutError`, `ConfigurationError`) for proper error categorization
+- Expanded `src/types.ts` with full TypeScript types: `AuthResponse`, `PaginatedResponse<T>`, `FetchOptions`, `SyncResult` - eliminating all `any` usage
 - Made database module properly encapsulated with singleton pool
 - Added graceful shutdown via `closeDB()` in the main entry point
 
 **Why it's better:**  
-Each function does one thing. Much easier to test, debug, and modify. If I need to change retry logic, I only touch `fetchWithRetry()`. If I need to change how a single campaign syncs, just `syncSingleCampaign()`.
+Each function does one thing. Configuration is centralized so changes don't require hunting through code. Custom error types make error handling explicit and enable proper retry decisions. Strong typing catches bugs at compile time instead of runtime.
 
 **Architecture decisions:**  
 Kept it functional rather than class-based. For this scope, classes would add ceremony without benefit. The module pattern with exported functions is simpler and works well.
@@ -277,10 +279,9 @@ Works as expected. Some batches take longer due to retries, but completes succes
 - Build a proper API client class with circuit breaker pattern
 - Structured logging with correlation IDs
 
-**Questions I have:**  
-- How often does this sync run in production? Might affect batching strategy
-- Is there a max campaign count we should expect?
-- Are there other endpoints that need similar sync logic?
+**Questions I'd ask before production deployment:**
+- Would a webhook-based push model from the Ad Platform be more efficient than polling, especially as client count scales?
+- Are there SLAs around sync freshness (e.g., data must be <5 min stale) that would influence the retry/backoff strategy?
 
 ---
 

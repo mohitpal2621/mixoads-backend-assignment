@@ -1,20 +1,30 @@
-import fetch from 'node-fetch';
+import fetch, { Response } from 'node-fetch';
 import { saveCampaignToDB } from './database';
-import { Campaign } from './types';
+import { CONFIG } from './config';
+import { TimeoutError, ConfigurationError } from './errors';
+import {
+  Campaign,
+  AuthResponse,
+  PaginatedResponse,
+  FetchOptions,
+} from './types';
 
-// Configuration constants
-const API_BASE_URL = process.env.AD_PLATFORM_API_URL || 'http://localhost:3001';
-const PAGE_SIZE = 10;
-const MAX_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 1000;
-const CONCURRENCY_LIMIT = 5;
-
+/**
+ * Delay execution for specified milliseconds.
+ */
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Helper function to add timeout to fetch requests
-async function fetchWithTimeout(url: string, options: any, timeout = 5000) {
+/**
+ * Fetch with timeout using AbortController.
+ * Prevents requests from hanging indefinitely.
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: FetchOptions,
+  timeout: number = CONFIG.api.timeout
+): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -25,21 +35,27 @@ async function fetchWithTimeout(url: string, options: any, timeout = 5000) {
     });
     clearTimeout(timeoutId);
     return response;
-  } catch (error: any) {
+  } catch (error: unknown) {
     clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timeout');
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new TimeoutError(`Request to ${url} timed out after ${timeout}ms`);
     }
     throw error;
   }
 }
 
+/**
+ * Fetch with retry logic, exponential backoff, and rate limit handling.
+ * - 429: Waits for retry-after, doesn't count as retry attempt
+ * - 503: Retries with exponential backoff
+ * - Timeout: Retries with exponential backoff
+ */
 async function fetchWithRetry(
   url: string,
-  options: any,
-  timeout = 5000,
-  maxRetries = MAX_RETRIES,
-): Promise<any> {
+  options: FetchOptions,
+  timeout: number = CONFIG.api.timeout,
+  maxRetries: number = CONFIG.retry.maxRetries,
+): Promise<Response> {
   let lastError: Error | null = null;
   let attempt = 0;
 
@@ -47,6 +63,7 @@ async function fetchWithRetry(
     try {
       const response = await fetchWithTimeout(url, options, timeout);
 
+      // Rate limited - wait and retry (doesn't count as attempt)
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
         console.log(`   ⚠️ Rate limited. Waiting ${retryAfter} seconds...`);
@@ -54,8 +71,9 @@ async function fetchWithRetry(
         continue;
       }
 
+      // Service unavailable - retry with backoff
       if (response.status === 503) {
-        const backoffTime = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+        const backoffTime = CONFIG.retry.initialBackoffMs * Math.pow(2, attempt);
         console.log(`   ⚠️ Server unavailable (503). Retrying in ${backoffTime}ms... (attempt ${attempt + 1}/${maxRetries})`);
         await delay(backoffTime);
         attempt++;
@@ -63,10 +81,10 @@ async function fetchWithRetry(
       }
 
       return response;
-    } catch (error: any) {
-      lastError = error;
-      const backoffTime = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
-      console.log(`   ⚠️ Request failed: ${error.message}. Retrying in ${backoffTime}ms... (attempt ${attempt + 1}/${maxRetries})`);
+    } catch (error: unknown) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      const backoffTime = CONFIG.retry.initialBackoffMs * Math.pow(2, attempt);
+      console.log(`   ⚠️ Request failed: ${lastError.message}. Retrying in ${backoffTime}ms... (attempt ${attempt + 1}/${maxRetries})`);
       await delay(backoffTime);
       attempt++;
     }
@@ -75,10 +93,14 @@ async function fetchWithRetry(
   throw lastError || new Error('Max retries exceeded');
 }
 
+/**
+ * Sync a single campaign to the database.
+ * Returns true on success, false on failure.
+ */
 async function syncSingleCampaign(campaign: Campaign, accessToken: string): Promise<boolean> {
   try {
     const syncResponse = await fetchWithRetry(
-      `${API_BASE_URL}/api/campaigns/${campaign.id}/sync`,
+      `${CONFIG.api.baseUrl}/api/campaigns/${campaign.id}/sync`,
       {
         method: 'POST',
         headers: {
@@ -87,7 +109,7 @@ async function syncSingleCampaign(campaign: Campaign, accessToken: string): Prom
         },
         body: JSON.stringify({ campaign_id: campaign.id })
       },
-      10000
+      CONFIG.api.syncTimeout
     );
 
     if (!syncResponse.ok) {
@@ -99,22 +121,30 @@ async function syncSingleCampaign(campaign: Campaign, accessToken: string): Prom
 
     console.log(`   ✓ Synced: ${campaign.name}`);
     return true;
-  } catch (error: any) {
-    console.error(`   ✗ Failed: ${campaign.name} - ${error.message}`);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`   ✗ Failed: ${campaign.name} - ${message}`);
     return false;
   }
 }
 
+/**
+ * Process campaigns in batches with controlled concurrency.
+ * Adds delay between batches to avoid overwhelming the API.
+ */
 async function processCampaignsInBatches(
   campaigns: Campaign[],
   accessToken: string,
-  batchSize: number = CONCURRENCY_LIMIT
+  batchSize: number = CONFIG.concurrency.batchSize
 ): Promise<number> {
   let successCount = 0;
 
   for (let i = 0; i < campaigns.length; i += batchSize) {
     const batch = campaigns.slice(i, i + batchSize);
-    console.log(`\n   Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(campaigns.length / batchSize)} (${batch.length} campaigns)...`);
+    const batchNumber = Math.floor(i / batchSize) + 1;
+    const totalBatches = Math.ceil(campaigns.length / batchSize);
+
+    console.log(`\n   Processing batch ${batchNumber}/${totalBatches} (${batch.length} campaigns)...`);
 
     const results = await Promise.all(
       batch.map(campaign => syncSingleCampaign(campaign, accessToken))
@@ -122,41 +152,50 @@ async function processCampaignsInBatches(
 
     successCount += results.filter(Boolean).length;
 
-    // Small delay between batches to be nice to the API
+    // Delay between batches to be respectful to the API
     if (i + batchSize < campaigns.length) {
-      await delay(500);
+      await delay(CONFIG.concurrency.delayBetweenBatchesMs);
     }
   }
 
   return successCount;
 }
 
-export async function syncAllCampaigns() {
+/**
+ * Main sync orchestration function.
+ * Authenticates, fetches all campaigns (paginated), and syncs them to the database.
+ */
+export async function syncAllCampaigns(): Promise<void> {
   console.log('Syncing campaigns from Ad Platform...\n');
 
+  // Validate required environment variables
   const email = process.env.AD_PLATFORM_EMAIL;
   const password = process.env.AD_PLATFORM_PASSWORD;
 
   if (!email || !password) {
-    throw new Error('Missing AD_PLATFORM_EMAIL or AD_PLATFORM_PASSWORD environment variables');
+    throw new ConfigurationError('Missing AD_PLATFORM_EMAIL or AD_PLATFORM_PASSWORD environment variables');
   }
 
   const authString = Buffer.from(`${email}:${password}`).toString('base64');
 
   console.log('Step 1: Getting access token...');
 
-  const authResponse = await fetchWithRetry(`${API_BASE_URL}/auth/token`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${authString}`
-    }
-  }, 10000);
+  const authResponse = await fetchWithRetry(
+    `${CONFIG.api.baseUrl}/auth/token`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${authString}`
+      }
+    },
+    CONFIG.api.syncTimeout
+  );
 
   if (!authResponse.ok) {
     throw new Error(`Authentication failed: ${authResponse.status}`);
   }
 
-  const authData: any = await authResponse.json();
+  const authData = await authResponse.json() as AuthResponse;
   const accessToken = authData.access_token;
 
   console.log('✓ Access token obtained successfully');
@@ -171,20 +210,20 @@ export async function syncAllCampaigns() {
     console.log(`   Fetching page ${currentPage}...`);
 
     const campaignsResponse = await fetchWithRetry(
-      `${API_BASE_URL}/api/campaigns?page=${currentPage}&limit=${PAGE_SIZE}`,
+      `${CONFIG.api.baseUrl}/api/campaigns?page=${currentPage}&limit=${CONFIG.api.pageSize}`,
       {
         headers: {
           'Authorization': `Bearer ${accessToken}`
         }
       },
-      5000
+      CONFIG.api.timeout
     );
 
     if (!campaignsResponse.ok) {
       throw new Error(`API returned ${campaignsResponse.status}: ${campaignsResponse.statusText}`);
     }
 
-    const campaignsData: any = await campaignsResponse.json();
+    const campaignsData = await campaignsResponse.json() as PaginatedResponse<Campaign>;
 
     allCampaigns = allCampaigns.concat(campaignsData.data);
     hasMore = campaignsData.pagination.has_more;

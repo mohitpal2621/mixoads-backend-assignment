@@ -115,17 +115,17 @@ function authMiddleware(req, res, next) {
 app.get('/api/campaigns', authMiddleware, rateLimitMiddleware, (req, res) => {
   requestCounter++;
   
+  if (requestCounter % 10 === 0) {
+    console.log('Simulating timeout (no response)');
+    return;
+  }
+  
   if (requestCounter % 5 === 0) {
     console.log('Simulating 503 Service Unavailable');
     return res.status(503).json({
       error: 'Service temporarily unavailable',
       message: 'The service is experiencing issues. Please retry after a short delay.'
     });
-  }
-  
-  if (requestCounter % 10 === 0) {
-    console.log('Simulating timeout (no response)');
-    return;
   }
   
   const page = parseInt(req.query.page) || 1;
